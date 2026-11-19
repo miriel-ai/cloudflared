@@ -1,0 +1,115 @@
+# Fork-only CI (miriel-ai): keeps `master` a fast-forward mirror of
+# lexfrei/cloudflared and opens a PR that merges the newest
+# cloudflare/cloudflared release tag into `miriel`. Never force-pushes; the PR
+# is merged with a merge commit.
+#
+# Runs on GITHUB_TOKEN. Three things in this repository's configuration limit
+# what that token can do, and this job fails loudly rather than work around
+# them (see the PR description):
+#   - it cannot push commits that change .github/workflows/*  (no `workflows`
+#     permission), so a sync fails while upstream has workflow changes;
+#   - it can only open a PR if "Allow GitHub Actions to create and approve
+#     pull requests" is on, which it is not at the time of writing;
+#   - scheduled runs only fire from the default branch (master), not miriel.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: '43 5 * * 1' # Mondays 05:43 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would happen without pushing or opening a PR
+        type: boolean
+        default: false
+  # Registers the workflow on a non-default branch (a dispatch needs a prior
+  # run) and syncs once when the workflow itself changes.
+  push:
+    branches: [miriel]
+    paths:
+      - .github/workflows/upstream-sync.yaml
+      - .github/scripts/upstream-sync.sh
+  # Runs the script's tests on the PR that changes it.
+  pull_request:
+    branches: [miriel]
+    paths:
+      - .github/workflows/upstream-sync.yaml
+      - .github/scripts/upstream-sync.sh
+      - .github/scripts/upstream-sync_test.sh
+
+concurrency:
+  group: upstream-sync-${{ github.event_name == 'pull_request' && github.ref || 'run' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/lexfrei/cloudflared.git
+  RELEASE_URL: https://github.com/cloudflare/cloudflared.git
+  BASE_BRANCH: miriel
+  MIRROR_BRANCH: master
+
+jobs:
+  test:
+    name: Script tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run upstream-sync tests
+        run: bash .github/scripts/upstream-sync_test.sh
+
+  sync:
+    name: Sync master and open a PR into miriel
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fast-forward master and publish the newest release
+        id: sync
+        env:
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: ./.github/scripts/upstream-sync.sh
+
+      - name: Open a PR into miriel
+        if: steps.sync.outputs.needs_pr == 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.sync.outputs.tag }}
+          BRANCH: ${{ steps.sync.outputs.branch }}
+          SHA: ${{ steps.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          existing="$(gh pr list --repo "${GITHUB_REPOSITORY}" --base "${BASE_BRANCH}" --head "${BRANCH}" --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            echo "PR #${existing} already merges ${BRANCH} into ${BASE_BRANCH}; nothing to open."
+            exit 0
+          fi
+
+          body="Merges cloudflare/cloudflared release \`${TAG}\` (${SHA:0:12}) into \`${BASE_BRANCH}\`.
+
+          Opened by .github/workflows/upstream-sync.yaml. Merge with a merge commit; do not force-push or rebase. Re-check that the two fork patches (OverrideProxy, Observer.Close) still apply, and that the controller's TestVendoredCloudflaredUpgradeConstantsPinned canary is updated deliberately when this is vendored there."
+
+          if ! gh pr create --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" --head "${BRANCH}" \
+            --title "chore: merge cloudflared ${TAG} into ${BASE_BRANCH}" \
+            --body "${body}"; then
+            echo "::error::could not open the PR. If the message above says GitHub Actions is not permitted to create pull requests, open it by hand: https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${BRANCH}?expand=1"
+            exit 1
+          fi
