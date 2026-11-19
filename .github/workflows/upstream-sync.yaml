@@ -96,7 +96,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          existing="$(gh pr list --repo "${GITHUB_REPOSITORY}" --base "${BASE_BRANCH}" --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          existing="$(gh pr list --repo "${GITHUB_REPOSITORY}" --base "${BASE_BRANCH}" --head "${BRANCH}" --state open --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')"
           if [[ -n "${existing}" ]]; then
             echo "PR #${existing} already merges ${BRANCH} into ${BASE_BRANCH}; nothing to open."
             exit 0
